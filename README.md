@@ -214,8 +214,8 @@ Use the `ping` tool to verify connectivity:
 ### Debugging
 | Tool | Description |
 |------|-------------|
-| `set_breakpoint`, `set_data_breakpoint` | Hardware breakpoints |
-| `start_dbvm_watch` | Ring -1 invisible tracing |
+| `set_breakpoint`, `set_data_breakpoint` | Hardware breakpoints with non-blocking hit capture |
+| `start_dbvm_watch` | Ring -1 tracing; requires explicit host-crash-risk acknowledgement and uses exact, low-volume defaults |
 
 ### Process Lifecycle
 | Tool | Description |

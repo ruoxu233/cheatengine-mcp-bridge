@@ -792,9 +792,38 @@ def get_physical_address(address: str) -> str:
     return format_result(ce_client.send_command("get_physical_address", {"address": address}))
 
 @mcp.tool()
-def start_dbvm_watch(address: str, mode: str = "w", max_entries: int = 1000) -> str:
-    """Start invisible DBVM hypervisor watch. Modes: 'w' (writes), 'r' (reads), 'x' (execute)."""
-    return format_result(ce_client.send_command("start_dbvm_watch", {"address": address, "mode": mode, "max_entries": max_entries}))
+def start_dbvm_watch(
+    address: str,
+    mode: str = "w",
+    size: int = 1,
+    max_entries: int = 64,
+    acknowledge_system_crash_risk: bool = False,
+    log_same_rip: bool = False,
+    capture_stack: bool = False,
+    capture_fpu: bool = False,
+    whole_page: bool = False,
+    acknowledge_whole_page_risk: bool = False,
+) -> str:
+    """Start a DBVM hypervisor watch with conservative defaults.
+
+    DBVM executes in the hypervisor and a bad watch can crash or reboot the
+    entire host. The call is rejected unless acknowledge_system_crash_risk is
+    explicitly true. By default it watches only the requested byte range,
+    stores 64 register-only entries, and does not log the whole page or a 4 KiB
+    stack snapshot. Modes: 'w' (writes), 'r' (reads), 'x' (execute).
+    """
+    return format_result(ce_client.send_command("start_dbvm_watch", {
+        "address": address,
+        "mode": mode,
+        "size": size,
+        "max_entries": max_entries,
+        "acknowledge_system_crash_risk": acknowledge_system_crash_risk,
+        "log_same_rip": log_same_rip,
+        "capture_stack": capture_stack,
+        "capture_fpu": capture_fpu,
+        "whole_page": whole_page,
+        "acknowledge_whole_page_risk": acknowledge_whole_page_risk,
+    }))
 
 @mcp.tool()
 def stop_dbvm_watch(address: str) -> str:

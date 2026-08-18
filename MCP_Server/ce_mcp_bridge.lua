@@ -1444,7 +1444,7 @@ function cmd_set_breakpoint(params)
     local bpId = params.id
     local captureRegs = params.capture_registers ~= false
     local captureStackFlag = params.capture_stack or false
-    local stackDepth = params.stack_depth or 16
+    local stackDepth = math.max(1, math.min(tonumber(params.stack_depth) or 16, 256))
     
     if type(addr) == "string" then addr = getAddressSafe(addr) end
     if not addr then return { success = false, error = "Invalid address" } end
@@ -1497,7 +1497,10 @@ function cmd_set_breakpoint(params)
         
         table.insert(serverState.breakpoint_hits[bpId], hitData)
         debug_continueFromBreakpoint(co_run)
-        return 1
+        -- Per-breakpoint callbacks return WaitingToContinue to CE.  We have
+        -- already continued explicitly, so returning 1 races CE back into its
+        -- interactive breakpoint path (and is unsafe with kernel debuggers).
+        return 0
     end)
     
     serverState.hw_bp_slots[slot] = { id = bpId, address = addr }
@@ -1562,7 +1565,7 @@ function cmd_set_data_breakpoint(params)
         
         table.insert(serverState.breakpoint_hits[bpId], hitData)
         debug_continueFromBreakpoint(co_run)
-        return 1
+        return 0
     end)
     
     serverState.hw_bp_slots[slot] = { id = bpId, address = addr }
@@ -2195,23 +2198,34 @@ end
 -- This is the "Find what writes/reads" equivalent but at Ring -1 (invisible to games)
 function cmd_start_dbvm_watch(params)
     local addr = params.address
-    local mode = params.mode or "w"  -- "w" = write, "r" = read, "rw" = both, "x" = execute
-    local maxEntries = params.max_entries or 1000  -- Internal buffer size
+    local mode = params.mode or "w"  -- "w" = write, "r" = read, "x" = execute
+    local maxEntries = math.max(1, math.min(tonumber(params.max_entries) or 64, 4096))
+    local byteSize = math.max(1, math.min(tonumber(params.size) or 1, 4096))
+
+    -- A malformed or overly broad DBVM watch can hang every CPU and produce a
+    -- CLOCK_WATCHDOG_TIMEOUT.  Never make a hypervisor call by accident.
+    if params.acknowledge_system_crash_risk ~= true then
+        return {
+            success = false,
+            error_code = "DBVM_RISK_NOT_ACKNOWLEDGED",
+            error = "DBVM watches can crash or reboot the host. Set acknowledge_system_crash_risk=true after validating on a disposable target."
+        }
+    end
+
+    if mode ~= "w" and mode ~= "r" and mode ~= "x" then
+        return { success = false, error_code = "INVALID_PARAMS", error = "mode must be 'w', 'r', or 'x'" }
+    end
     
     if type(addr) == "string" then addr = getAddressSafe(addr) end
     if not addr then return { success = false, error = "Invalid address" } end
     
     -- 0. Safety Checks
-    if not dbk_initialized() then
+    if type(dbk_initialized) ~= "function" or not dbk_initialized() then
         return { success = false, error = "DBK driver not loaded. Go to Settings -> Debugger -> Kernelmode" }
     end
     
-    if not dbvm_initialized() then
-        -- Try to initialize if possible
-        pcall(dbvm_initialize)
-        if not dbvm_initialized() then
-            return { success = false, error = "DBVM not running. Go to Settings -> Debugger -> Use DBVM" }
-        end
+    if type(dbvm_initialized) ~= "function" or not dbvm_initialized() then
+        return { success = false, error = "DBVM not running. Initialize it explicitly in CE before starting a watch." }
     end
 
     -- 1. Get Physical Address (DBVM works on physical RAM)
@@ -2235,11 +2249,22 @@ function cmd_start_dbvm_watch(params)
     end
     
     -- 3. Configure watch options
-    -- Bit 0: Log multiple times (1 = yes)
-    -- Bit 1: Ignore size / log whole page (2)
-    -- Bit 2: Log FPU registers (4)
-    -- Bit 3: Log Stack (8)
-    local options = 1 + 2 + 8  -- Multiple logging + whole page + stack context
+    -- CE EPTO flags: 1=repeat same RIP, 2=whole page, 4=FPU, 8=4 KiB stack.
+    -- Start with an exact, context-only watch. Expensive flags are opt-in.
+    local options = 0
+    if params.log_same_rip == true then options = options | 1 end
+    if params.capture_fpu == true then options = options | 4 end
+    if params.capture_stack == true then options = options | 8 end
+    if params.whole_page == true then
+        if params.acknowledge_whole_page_risk ~= true then
+            return {
+                success = false,
+                error_code = "DBVM_WHOLE_PAGE_RISK_NOT_ACKNOWLEDGED",
+                error = "whole_page logs every access in a 4 KiB page. Set acknowledge_whole_page_risk=true to enable it explicitly."
+            }
+        end
+        options = options | 2
+    end
     
     -- 4. Start the appropriate watch based on mode
     local watch_id
@@ -2248,16 +2273,22 @@ function cmd_start_dbvm_watch(params)
     log(string.format("Starting DBVM watch on Phys: 0x%X (Mode: %s)", phys, mode))
 
     if mode == "x" then
-        if not dbvm_watch_executes then
+        if type(dbvm_watch_executes) ~= "function" then
             return { success = false, error = "dbvm_watch_executes function missing from CE Lua engine" }
         end
-        okWatch, result = pcall(dbvm_watch_executes, phys, 1, options, maxEntries)
+        okWatch, result = pcall(dbvm_watch_executes, phys, byteSize, options, maxEntries)
         watch_id = okWatch and result or nil
-    elseif mode == "r" or mode == "rw" then
-        okWatch, result = pcall(dbvm_watch_reads, phys, 1, options, maxEntries)
+    elseif mode == "r" then
+        if type(dbvm_watch_reads) ~= "function" then
+            return { success = false, error = "dbvm_watch_reads function missing from CE Lua engine" }
+        end
+        okWatch, result = pcall(dbvm_watch_reads, phys, byteSize, options, maxEntries)
         watch_id = okWatch and result or nil
     else  -- default: write
-        okWatch, result = pcall(dbvm_watch_writes, phys, 1, options, maxEntries)
+        if type(dbvm_watch_writes) ~= "function" then
+            return { success = false, error = "dbvm_watch_writes function missing from CE Lua engine" }
+        end
+        okWatch, result = pcall(dbvm_watch_writes, phys, byteSize, options, maxEntries)
         watch_id = okWatch and result or nil
     end
     
@@ -2270,7 +2301,7 @@ function cmd_start_dbvm_watch(params)
         }
     end
     
-    if not watch_id then
+    if type(watch_id) ~= "number" or watch_id < 0 then
         return {
             success = false,
             virtual_address = toHex(addr),
@@ -2284,6 +2315,8 @@ function cmd_start_dbvm_watch(params)
         id = watch_id,
         physical = phys,
         mode = mode,
+        size = byteSize,
+        options = options,
         start_time = os.time()
     }
     
@@ -2302,7 +2335,6 @@ end
 -- This is CRITICAL for continuous packet monitoring - logs can be polled repeatedly
 function cmd_poll_dbvm_watch(params)
     local addr = params.address
-    local clear = (params.clear ~= false)  -- nil→true, false→false, true→true
     local max_results = params.max_results or 1000
     
     if type(addr) == "string" then addr = getAddressSafe(addr) end
@@ -2350,9 +2382,8 @@ function cmd_poll_dbvm_watch(params)
         end
     end
 
-    if clear then
-        pcall(dbvm_watch_clearlog, watch_id)
-    end
+    -- dbvm_watch_retrievelog is the CE retrieval primitive. There is no
+    -- dbvm_watch_clearlog Lua API; do not silently call an undefined function.
 
     local uptime = os.time() - (watchInfo.start_time or os.time())
     
@@ -4822,7 +4853,7 @@ function cmd_debug_set_breakpoint_for_thread(params)
             registers = captureRegisters(),
         })
         debug_continueFromBreakpoint(co_run)
-        return 1
+        return 0
     end)
 
     if not setOk then
