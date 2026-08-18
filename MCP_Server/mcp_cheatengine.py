@@ -746,14 +746,58 @@ def set_breakpoint(address: str, id: str = None, capture_registers: bool = True,
     }))
 
 @mcp.tool()
-def set_data_breakpoint(address: str, id: str = None, access_type: str = "w", size: int = 4) -> str:
-    """Set a hardware data breakpoint (watchpoint). Types: 'r' (read), 'w' (write), 'rw' (access)."""
+def set_data_breakpoint(
+    address: str,
+    id: str = None,
+    access_type: str = "w",
+    size: int = 4,
+    capture_registers: bool = True,
+    capture_stack: bool = True,
+    stack_depth: int = 32,
+) -> str:
+    """Set an aligned hardware data breakpoint (watchpoint).
+
+    Types: 'r' (access), 'w' (write), 'rw' (access). Sizes: 1, 2, 4, or 8.
+    The reported instruction is corrected to the instruction before RIP/EIP,
+    because x86/x64 data breakpoints trap after the memory access.
+    """
     return format_result(ce_client.send_command("set_data_breakpoint", {
         "address": address, 
         "id": id,
         "access_type": access_type,
-        "size": size
+        "size": size,
+        "capture_registers": capture_registers,
+        "capture_stack": capture_stack,
+        "stack_depth": stack_depth,
     }))
+
+@mcp.tool()
+def start_native_code_finder(address: str, id: str = None, access_type: str = "rw", size: int = 1) -> str:
+    """Start CE's native Find-out-what-accesses/writes collector.
+
+    This uses CE's bo_FindCode debugger-event path instead of a synchronized
+    Lua breakpoint callback. Keep Use Global Debug Routines disabled.
+    """
+    return format_result(ce_client.send_command("start_native_code_finder", {
+        "address": address,
+        "id": id,
+        "access_type": access_type,
+        "size": size,
+    }))
+
+@mcp.tool()
+def get_native_code_finder_hits(id: str, offset: int = 0, limit: int = 100) -> str:
+    """Read unique writer/accessor instructions collected by CE's native code finder."""
+    return format_result(ce_client.send_command("get_native_code_finder_hits", {
+        "id": id,
+        "offset": offset,
+        "limit": limit,
+    }))
+
+@mcp.tool()
+def stop_native_code_finder(id: str) -> str:
+    """Stop and close a native CE code-finder collector."""
+    return format_result(ce_client.send_command("stop_native_code_finder", {"id": id}))
 
 @mcp.tool()
 def remove_breakpoint(id: str) -> str:

@@ -17,7 +17,8 @@ local serverState = {
     breakpoints = {},
     breakpoint_hits = {},
     hw_bp_slots = {},      -- Hardware breakpoint slots (max 4)
-    active_watches = {}    -- DBVM watch IDs for hypervisor-level tracing
+    active_watches = {},   -- DBVM watch IDs for hypervisor-level tracing
+    native_code_finders = {}
 }
 
 -- ============================================================================
@@ -375,11 +376,17 @@ local function cleanupZombieState()
         end
     end
 
+    for _, state in pairs(serverState.native_code_finders or {}) do
+        pcall(debug_stopCodeFinder, state.finder)
+        pcall(function() state.finder.close() end)
+    end
+
     -- Reset all tracking tables
     serverState.breakpoints = {}
     serverState.breakpoint_hits = {}
     serverState.hw_bp_slots = {}
     serverState.active_watches = {}
+    serverState.native_code_finders = {}
 
     -- 4. Release any mapped memory MDL handles (Unit-21)
     if mappedMemoryMDL then
@@ -1439,7 +1446,22 @@ local function clearGhostBpSlot(addr)
     end
 end
 
+local function rejectUnsafeGlobalDebug()
+    if type(getSettingsForm) ~= "function" then return nil end
+    local ok, settings = pcall(getSettingsForm)
+    if ok and settings and settings.cbGlobalDebug and settings.cbGlobalDebug.Checked then
+        return {
+            success = false,
+            error_code = "UNSAFE_GLOBAL_DEBUG",
+            error = "Disable 'Use Global Debug Routines' and fully restart Cheat Engine before setting breakpoints"
+        }
+    end
+    return nil
+end
+
 function cmd_set_breakpoint(params)
+    local unsafe = rejectUnsafeGlobalDebug()
+    if unsafe then return unsafe end
     local addr = params.address
     local bpId = params.id
     local captureRegs = params.capture_registers ~= false
@@ -1509,13 +1531,29 @@ function cmd_set_breakpoint(params)
 end
 
 function cmd_set_data_breakpoint(params)
+    local unsafe = rejectUnsafeGlobalDebug()
+    if unsafe then return unsafe end
     local addr = params.address
     local bpId = params.id
     local accessType = params.access_type or "w"  -- r, w, rw
-    local size = params.size or 4
+    local size = tonumber(params.size) or 4
+    local captureRegs = params.capture_registers ~= false
+    -- Default on for compatibility with older MCP server processes whose
+    -- set_data_breakpoint wrapper does not forward the new capture options.
+    local captureStackFlag = params.capture_stack ~= false
+    local stackDepth = math.max(1, math.min(tonumber(params.stack_depth) or 32, 256))
     
     if type(addr) == "string" then addr = getAddressSafe(addr) end
     if not addr then return { success = false, error = "Invalid address" } end
+    if size ~= 1 and size ~= 2 and size ~= 4 and size ~= 8 then
+        return { success = false, error_code = "INVALID_PARAMS", error = "Hardware data breakpoint size must be 1, 2, 4, or 8 bytes" }
+    end
+    if addr % size ~= 0 then
+        return { success = false, error_code = "INVALID_PARAMS", error = "Hardware data breakpoint address must be aligned to its size" }
+    end
+    if accessType ~= "r" and accessType ~= "w" and accessType ~= "rw" then
+        return { success = false, error_code = "INVALID_PARAMS", error = "access_type must be 'r', 'w', or 'rw'" }
+    end
 
     bpId = bpId or tostring(addr)
     -- Avoid collision if an existing breakpoint has the same ID
@@ -1549,19 +1587,40 @@ function cmd_set_data_breakpoint(params)
     -- CRITICAL: Use bpmDebugRegister for hardware breakpoints (anti-cheat safe)
     -- Signature: debug_setBreakpoint(address, size, trigger, breakpointmethod, function)
     debug_setBreakpoint(addr, size, bpType, bpmDebugRegister, function()
-        local arch = getArchInfo()
-        local instPtr = arch.instPtr
+        local is64 = targetIs64Bit()
+        local instPtr = is64 and RIP or EIP
+        local stackPtr = is64 and RSP or ESP
+        -- Global Debug can hold a kernel debug event here. Do not re-enter
+        -- process-memory or disassembler APIs before continuing the target.
         local hitData = {
             id = bpId,
             type = "data_" .. accessType,
             address = toHex(addr),
             timestamp = os.time(),
             breakpoint_type = "hardware_data",
-            value = arch.is64bit and readQword(addr) or readInteger(addr),
-            registers = captureRegisters(),
-            instruction = instPtr and disassemble(instPtr) or "???",
-            arch = arch.is64bit and "x64" or "x86"
+            next_instruction_address = instPtr and toHex(instPtr) or nil,
+            deferred_capture = true,
+            deferred_instruction_pointer = instPtr,
+            deferred_stack_pointer = stackPtr,
+            deferred_stack_depth = captureStackFlag and stackDepth or 0,
+            arch = is64 and "x64" or "x86"
         }
+
+        if captureRegs then
+            if is64 then
+                hitData.deferred_registers = {
+                    RAX=RAX, RBX=RBX, RCX=RCX, RDX=RDX, RSI=RSI, RDI=RDI,
+                    RBP=RBP, RSP=RSP, RIP=RIP, R8=R8, R9=R9, R10=R10,
+                    R11=R11, R12=R12, R13=R13, R14=R14, R15=R15,
+                    EFLAGS=EFLAGS
+                }
+            else
+                hitData.deferred_registers = {
+                    EAX=EAX, EBX=EBX, ECX=ECX, EDX=EDX, ESI=ESI, EDI=EDI,
+                    EBP=EBP, ESP=ESP, EIP=EIP, EFLAGS=EFLAGS
+                }
+            end
+        end
         
         table.insert(serverState.breakpoint_hits[bpId], hitData)
         debug_continueFromBreakpoint(co_run)
@@ -1571,7 +1630,120 @@ function cmd_set_data_breakpoint(params)
     serverState.hw_bp_slots[slot] = { id = bpId, address = addr }
     serverState.breakpoints[bpId] = { address = addr, slot = slot, type = "data" }
     
-    return { success = true, id = bpId, address = toHex(addr), slot = slot, access_type = accessType, method = "hardware_debug_register" }
+    return {
+        success = true,
+        id = bpId,
+        address = toHex(addr),
+        slot = slot,
+        access_type = accessType,
+        method = "hardware_debug_register",
+        capture_registers = captureRegs,
+        capture_stack = captureStackFlag,
+        stack_depth = captureStackFlag and stackDepth or 0
+    }
+end
+
+function cmd_start_native_code_finder(params)
+    local unsafe = rejectUnsafeGlobalDebug()
+    if unsafe then return unsafe end
+    if type(debug_startCodeFinder) ~= "function" then
+        return {
+            success = false,
+            error_code = "CE_API_UNAVAILABLE",
+            error = "This Cheat Engine build does not expose debug_startCodeFinder"
+        }
+    end
+
+    local addr = params.address
+    local size = tonumber(params.size) or 1
+    local accessType = tostring(params.access_type or "rw"):lower()
+    if type(addr) == "string" then addr = getAddressSafe(addr) end
+    if not addr then return { success = false, error_code = "INVALID_PARAMS", error = "Invalid address" } end
+    if size <= 0 then return { success = false, error_code = "INVALID_PARAMS", error = "size must be positive" } end
+    if accessType ~= "w" and accessType ~= "rw" and accessType ~= "r" then
+        return { success = false, error_code = "INVALID_PARAMS", error = "access_type must be 'w', 'r', or 'rw'" }
+    end
+
+    local finderId = params.id or ("native_" .. tostring(addr))
+    if serverState.native_code_finders[finderId] then
+        return { success = false, error_code = "ALREADY_EXISTS", error = "Native code finder ID already exists" }
+    end
+
+    local trigger = accessType == "w" and bptWrite or bptAccess
+    local ok, finder = pcall(debug_startCodeFinder, addr, size, trigger)
+    if not ok or not finder then
+        return { success = false, error_code = "START_FAILED", error = tostring(finder) }
+    end
+
+    serverState.native_code_finders[finderId] = {
+        finder = finder,
+        address = addr,
+        size = size,
+        access_type = accessType
+    }
+    return {
+        success = true,
+        id = finderId,
+        address = toHex(addr),
+        size = size,
+        access_type = accessType,
+        method = "ce_native_bo_FindCode"
+    }
+end
+
+function cmd_get_native_code_finder_hits(params)
+    local finderId = params.id
+    local state = finderId and serverState.native_code_finders[finderId]
+    if not state then return { success = false, error_code = "NOT_FOUND", error = "Native code finder not found" } end
+
+    local ok, result = pcall(function()
+        local list = state.finder.findComponentByName("FoundCodeList")
+        if not list then error("FoundCodeList component is unavailable") end
+        local hits = {}
+        for i = 0, list.Items.Count - 1 do
+            local item = list.Items[i]
+            local opcode = item.SubItems[0] or ""
+            local addressText = opcode:match("^%s*([%x]+)")
+            hits[#hits + 1] = {
+                count = tonumber(item.Caption) or 0,
+                instruction = opcode,
+                instruction_address = addressText and toHex(tonumber(addressText, 16)) or nil
+            }
+        end
+        return hits
+    end)
+    if not ok then return { success = false, error_code = "READ_FAILED", error = tostring(result) } end
+
+    local limit, offset, page, total = paginate(params, result, 100)
+    return { success = true, id = finderId, total = total, offset = offset, limit = limit, returned = #page, hits = page }
+end
+
+function cmd_stop_native_code_finder(params)
+    local finderId = params.id
+    local state = finderId and serverState.native_code_finders[finderId]
+    if not state then return { success = false, error_code = "NOT_FOUND", error = "Native code finder not found" } end
+
+    local ok, stopped = pcall(debug_stopCodeFinder, state.finder)
+    pcall(function() state.finder.close() end)
+    serverState.native_code_finders[finderId] = nil
+    if not ok then return { success = false, error_code = "STOP_FAILED", error = tostring(stopped) } end
+    return { success = true, id = finderId, stopped = stopped == true }
+end
+
+local function captureStackAt(stackPtr, depth, is64bit)
+    local stack = {}
+    if not stackPtr then return stack end
+    local ptrSize = is64bit and 8 or 4
+    for i = 0, depth - 1 do
+        local val
+        if is64bit then
+            val = readQword(stackPtr + i * ptrSize)
+        else
+            val = readInteger(stackPtr + i * ptrSize)
+        end
+        if val then stack[i] = toHex(val) end
+    end
+    return stack
 end
 
 function cmd_remove_breakpoint(params)
@@ -1590,6 +1762,45 @@ function cmd_remove_breakpoint(params)
     end
     
     return { success = false, error = "Breakpoint not found: " .. tostring(bpId) }
+end
+
+local function enrichDeferredDataHit(hit)
+    if not hit.deferred_capture then return end
+
+    local nextInst = hit.deferred_instruction_pointer
+    local accessInst = nextInst
+    if nextInst and type(getPreviousOpcode) == "function" then
+        local okPrevious, previous = pcall(getPreviousOpcode, nextInst)
+        if okPrevious and previous and previous ~= 0 then accessInst = previous end
+    end
+    hit.instruction_address = accessInst and toHex(accessInst) or nil
+    hit.instruction = accessInst and disassemble(accessInst) or "???"
+
+    local watchAddress = getAddressSafe(hit.address)
+    if watchAddress then
+        if hit.arch == "x64" then
+            hit.value = readQword(watchAddress)
+        else
+            hit.value = readInteger(watchAddress)
+        end
+    end
+
+    if hit.deferred_registers then
+        hit.registers = { arch = hit.arch }
+        for name, value in pairs(hit.deferred_registers) do
+            hit.registers[name] = value and toHex(value) or nil
+        end
+    end
+    if hit.deferred_stack_depth and hit.deferred_stack_depth > 0 then
+        hit.stack = captureStackAt(hit.deferred_stack_pointer,
+            hit.deferred_stack_depth, hit.arch == "x64")
+    end
+
+    hit.deferred_capture = nil
+    hit.deferred_instruction_pointer = nil
+    hit.deferred_stack_pointer = nil
+    hit.deferred_stack_depth = nil
+    hit.deferred_registers = nil
 end
 
 function cmd_get_breakpoint_hits(params)
@@ -1611,6 +1822,7 @@ function cmd_get_breakpoint_hits(params)
     end
 
     local limit, offset, page, total = paginate(params, hits, 100)
+    for _, hit in ipairs(page) do enrichDeferredDataHit(hit) end
     return { success = true, total = total, offset = offset, limit = limit, returned = #page, hits = page }
 end
 
@@ -1633,9 +1845,15 @@ function cmd_clear_all_breakpoints(params)
         pcall(function() debug_removeBreakpoint(bp.address) end)
         count = count + 1
     end
+    for _, state in pairs(serverState.native_code_finders) do
+        pcall(debug_stopCodeFinder, state.finder)
+        pcall(function() state.finder.close() end)
+        count = count + 1
+    end
     serverState.breakpoints = {}
     serverState.breakpoint_hits = {}
     serverState.hw_bp_slots = {}
+    serverState.native_code_finders = {}
     return { success = true, removed = count }
 end
 
@@ -5789,6 +6007,9 @@ local commandHandlers = {
     set_execution_breakpoint = cmd_set_breakpoint,  -- Alias
     set_data_breakpoint = cmd_set_data_breakpoint,
     set_write_breakpoint = cmd_set_data_breakpoint,  -- Alias
+    start_native_code_finder = cmd_start_native_code_finder,
+    get_native_code_finder_hits = cmd_get_native_code_finder_hits,
+    stop_native_code_finder = cmd_stop_native_code_finder,
     remove_breakpoint = cmd_remove_breakpoint,
     get_breakpoint_hits = cmd_get_breakpoint_hits,
     list_breakpoints = cmd_list_breakpoints,
