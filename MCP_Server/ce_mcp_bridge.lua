@@ -1676,6 +1676,27 @@ function cmd_start_native_code_finder(params)
         return { success = false, error_code = "START_FAILED", error = tostring(finder) }
     end
 
+    local indirectStackOffset = math.max(0, tonumber(params.indirect_stack_offset) or 0)
+    local indirectSize = math.max(0, math.min(tonumber(params.indirect_size) or 0, 4096))
+    if indirectSize > 0 then
+        if type(debug_configureCodeFinderEvents) ~= "function" then
+            pcall(debug_stopCodeFinder, finder)
+            pcall(function() finder.close() end)
+            return {
+                success = false,
+                error_code = "CE_API_UNAVAILABLE",
+                error = "This Cheat Engine build does not expose indirect event capture"
+            }
+        end
+        local configured, configureResult = pcall(
+            debug_configureCodeFinderEvents, finder, indirectStackOffset, indirectSize)
+        if not configured or not configureResult then
+            pcall(debug_stopCodeFinder, finder)
+            pcall(function() finder.close() end)
+            return { success = false, error_code = "CONFIGURE_FAILED", error = tostring(configureResult) }
+        end
+    end
+
     serverState.native_code_finders[finderId] = {
         finder = finder,
         address = addr,
@@ -1688,6 +1709,8 @@ function cmd_start_native_code_finder(params)
         address = toHex(addr),
         size = size,
         access_type = accessType,
+        indirect_stack_offset = indirectStackOffset,
+        indirect_size = indirectSize,
         method = "ce_native_bo_FindCode"
     }
 end
@@ -1775,6 +1798,10 @@ function cmd_drain_native_code_finder_events(params)
             current.sequence = tonumber(value) or 0
         elseif current and key == "STACK_BASE" then
             current.stack_base = "0x" .. value
+        elseif current and key == "INDIRECT_BASE" then
+            current.indirect_base = "0x" .. value
+        elseif current and key == "INDIRECT_HEX" then
+            current.indirect_hex = value
         elseif current and key and key:match("^STACK%d+$") then
             current.stack[#current.stack + 1] = "0x" .. value
         elseif current and key then

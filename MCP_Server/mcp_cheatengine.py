@@ -772,7 +772,14 @@ def set_data_breakpoint(
     }))
 
 @mcp.tool()
-def start_native_code_finder(address: str, id: str = None, access_type: str = "rw", size: int = 1) -> str:
+def start_native_code_finder(
+    address: str,
+    id: str = None,
+    access_type: str = "rw",
+    size: int = 1,
+    indirect_stack_offset: int = 0,
+    indirect_size: int = 0,
+) -> str:
     """Start CE's native Find-out-what-accesses/writes collector.
 
     This uses CE's bo_FindCode debugger-event path instead of a synchronized
@@ -783,6 +790,8 @@ def start_native_code_finder(address: str, id: str = None, access_type: str = "r
         "id": id,
         "access_type": access_type,
         "size": size,
+        "indirect_stack_offset": indirect_stack_offset,
+        "indirect_size": indirect_size,
     }))
 
 @mcp.tool()
