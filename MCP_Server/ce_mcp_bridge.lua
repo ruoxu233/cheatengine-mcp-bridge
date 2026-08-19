@@ -1678,6 +1678,8 @@ function cmd_start_native_code_finder(params)
 
     local indirectStackOffset = math.max(0, tonumber(params.indirect_stack_offset) or 0)
     local indirectSize = math.max(0, math.min(tonumber(params.indirect_size) or 0, 4096))
+    local nestedIndirectOffset = math.max(0, tonumber(params.nested_indirect_offset) or 0)
+    local nestedSize = math.max(0, math.min(tonumber(params.nested_size) or 0, 4096))
     if indirectSize > 0 then
         if type(debug_configureCodeFinderEvents) ~= "function" then
             pcall(debug_stopCodeFinder, finder)
@@ -1689,7 +1691,8 @@ function cmd_start_native_code_finder(params)
             }
         end
         local configured, configureResult = pcall(
-            debug_configureCodeFinderEvents, finder, indirectStackOffset, indirectSize)
+            debug_configureCodeFinderEvents, finder, indirectStackOffset,
+            indirectSize, nestedIndirectOffset, nestedSize)
         if not configured or not configureResult then
             pcall(debug_stopCodeFinder, finder)
             pcall(function() finder.close() end)
@@ -1711,6 +1714,8 @@ function cmd_start_native_code_finder(params)
         access_type = accessType,
         indirect_stack_offset = indirectStackOffset,
         indirect_size = indirectSize,
+        nested_indirect_offset = nestedIndirectOffset,
+        nested_size = nestedSize,
         method = "ce_native_bo_FindCode"
     }
 end
@@ -1802,6 +1807,10 @@ function cmd_drain_native_code_finder_events(params)
             current.indirect_base = "0x" .. value
         elseif current and key == "INDIRECT_HEX" then
             current.indirect_hex = value
+        elseif current and key == "NESTED_BASE" then
+            current.nested_base = "0x" .. value
+        elseif current and key == "NESTED_HEX" then
+            current.nested_hex = value
         elseif current and key and key:match("^STACK%d+$") then
             current.stack[#current.stack + 1] = "0x" .. value
         elseif current and key then

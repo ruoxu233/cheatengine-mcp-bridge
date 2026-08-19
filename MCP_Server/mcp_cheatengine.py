@@ -779,6 +779,8 @@ def start_native_code_finder(
     size: int = 1,
     indirect_stack_offset: int = 0,
     indirect_size: int = 0,
+    nested_indirect_offset: int = 0,
+    nested_size: int = 0,
 ) -> str:
     """Start CE's native Find-out-what-accesses/writes collector.
 
@@ -792,6 +794,8 @@ def start_native_code_finder(
         "size": size,
         "indirect_stack_offset": indirect_stack_offset,
         "indirect_size": indirect_size,
+        "nested_indirect_offset": nested_indirect_offset,
+        "nested_size": nested_size,
     }))
 
 @mcp.tool()
