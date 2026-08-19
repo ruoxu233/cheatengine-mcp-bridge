@@ -1660,8 +1660,8 @@ function cmd_start_native_code_finder(params)
     if type(addr) == "string" then addr = getAddressSafe(addr) end
     if not addr then return { success = false, error_code = "INVALID_PARAMS", error = "Invalid address" } end
     if size <= 0 then return { success = false, error_code = "INVALID_PARAMS", error = "size must be positive" } end
-    if accessType ~= "w" and accessType ~= "rw" and accessType ~= "r" then
-        return { success = false, error_code = "INVALID_PARAMS", error = "access_type must be 'w', 'r', or 'rw'" }
+    if accessType ~= "w" and accessType ~= "rw" and accessType ~= "r" and accessType ~= "x" then
+        return { success = false, error_code = "INVALID_PARAMS", error = "access_type must be 'w', 'r', 'rw', or 'x'" }
     end
 
     local finderId = params.id or ("native_" .. tostring(addr))
@@ -1669,7 +1669,8 @@ function cmd_start_native_code_finder(params)
         return { success = false, error_code = "ALREADY_EXISTS", error = "Native code finder ID already exists" }
     end
 
-    local trigger = accessType == "w" and bptWrite or bptAccess
+    local trigger = accessType == "w" and bptWrite or (accessType == "x" and bptExecute or bptAccess)
+    if accessType == "x" then size = 1 end
     local ok, finder = pcall(debug_startCodeFinder, addr, size, trigger)
     if not ok or not finder then
         return { success = false, error_code = "START_FAILED", error = tostring(finder) }
@@ -1700,15 +1701,37 @@ function cmd_get_native_code_finder_hits(params)
         local list = state.finder.findComponentByName("FoundCodeList")
         if not list then error("FoundCodeList component is unavailable") end
         local hits = {}
+        local includeDetails = params.include_details ~= false
+        local stackDepth = math.max(0, math.min(tonumber(params.stack_depth) or 32, 256))
         for i = 0, list.Items.Count - 1 do
             local item = list.Items[i]
             local opcode = item.SubItems[0] or ""
             local addressText = opcode:match("^%s*([%x]+)")
-            hits[#hits + 1] = {
+            local hit = {
                 count = tonumber(item.Caption) or 0,
                 instruction = opcode,
                 instruction_address = addressText and toHex(tonumber(addressText, 16)) or nil
             }
+            if includeDetails and type(debug_getCodeFinderDetails) == "function" then
+                local details = debug_getCodeFinderDetails(state.finder, i, stackDepth)
+                if type(details) == "string" then
+                    hit.registers = {}
+                    hit.stack = {}
+                    for line in details:gmatch("[^\r\n]+") do
+                        local key, value = line:match("^([^=]+)=(.*)$")
+                        if key == "HITCOUNT" then
+                            hit.saved_hit_count = tonumber(value)
+                        elseif key == "STACK_BASE" then
+                            hit.stack_base = "0x" .. value
+                        elseif key and key:match("^STACK%d+$") then
+                            hit.stack[#hit.stack + 1] = "0x" .. value
+                        elseif key and key ~= "ADDRESS" and key ~= "OPCODE" then
+                            hit.registers[key] = "0x" .. value
+                        end
+                    end
+                end
+            end
+            hits[#hits + 1] = hit
         end
         return hits
     end)
@@ -1716,6 +1739,55 @@ function cmd_get_native_code_finder_hits(params)
 
     local limit, offset, page, total = paginate(params, result, 100)
     return { success = true, id = finderId, total = total, offset = offset, limit = limit, returned = #page, hits = page }
+end
+
+function cmd_drain_native_code_finder_events(params)
+    local finderId = params.id
+    local state = finderId and serverState.native_code_finders[finderId]
+    if not state then return { success = false, error_code = "NOT_FOUND", error = "Native code finder not found" } end
+    if type(debug_drainCodeFinderEvents) ~= "function" then
+        return {
+            success = false,
+            error_code = "CE_API_UNAVAILABLE",
+            error = "This Cheat Engine build does not expose debug_drainCodeFinderEvents"
+        }
+    end
+
+    local limit = math.max(1, math.min(tonumber(params.limit) or 100, 1024))
+    local stackDepth = math.max(0, math.min(tonumber(params.stack_depth) or 32, 256))
+    local ok, raw = pcall(debug_drainCodeFinderEvents, state.finder, limit, stackDepth)
+    if not ok or type(raw) ~= "string" then
+        return { success = false, error_code = "READ_FAILED", error = tostring(raw) }
+    end
+
+    local events, current = {}, nil
+    local dropped = 0
+    for line in raw:gmatch("[^\r\n]+") do
+        local key, value = line:match("^([^=]+)=(.*)$")
+        if key == "DROPPED" then
+            dropped = tonumber(value) or 0
+        elseif line == "EVENT" then
+            current = { registers = {}, stack = {} }
+        elseif line == "END" then
+            if current then events[#events + 1] = current end
+            current = nil
+        elseif current and key == "SEQ" then
+            current.sequence = tonumber(value) or 0
+        elseif current and key == "STACK_BASE" then
+            current.stack_base = "0x" .. value
+        elseif current and key and key:match("^STACK%d+$") then
+            current.stack[#current.stack + 1] = "0x" .. value
+        elseif current and key then
+            current.registers[key] = "0x" .. value
+        end
+    end
+    return {
+        success = true,
+        id = finderId,
+        returned = #events,
+        dropped = dropped,
+        events = events
+    }
 end
 
 function cmd_stop_native_code_finder(params)
@@ -6009,6 +6081,7 @@ local commandHandlers = {
     set_write_breakpoint = cmd_set_data_breakpoint,  -- Alias
     start_native_code_finder = cmd_start_native_code_finder,
     get_native_code_finder_hits = cmd_get_native_code_finder_hits,
+    drain_native_code_finder_events = cmd_drain_native_code_finder_events,
     stop_native_code_finder = cmd_stop_native_code_finder,
     remove_breakpoint = cmd_remove_breakpoint,
     get_breakpoint_hits = cmd_get_breakpoint_hits,

@@ -786,12 +786,38 @@ def start_native_code_finder(address: str, id: str = None, access_type: str = "r
     }))
 
 @mcp.tool()
-def get_native_code_finder_hits(id: str, offset: int = 0, limit: int = 100) -> str:
-    """Read unique writer/accessor instructions collected by CE's native code finder."""
+def get_native_code_finder_hits(
+    id: str,
+    offset: int = 0,
+    limit: int = 100,
+    include_details: bool = True,
+    stack_depth: int = 32,
+) -> str:
+    """Read native code-finder hits, including the first-hit registers and stack."""
     return format_result(ce_client.send_command("get_native_code_finder_hits", {
         "id": id,
         "offset": offset,
         "limit": limit,
+        "include_details": include_details,
+        "stack_depth": stack_depth,
+    }))
+
+@mcp.tool()
+def drain_native_code_finder_events(
+    id: str,
+    limit: int = 100,
+    stack_depth: int = 32,
+) -> str:
+    """Consume per-execution register and stack snapshots from a native code finder.
+
+    Unlike get_native_code_finder_hits, this returns every queued execution
+    rather than one aggregate row per opcode. The CE-side queue is bounded and
+    reports how many old events were dropped if the consumer falls behind.
+    """
+    return format_result(ce_client.send_command("drain_native_code_finder_events", {
+        "id": id,
+        "limit": limit,
+        "stack_depth": stack_depth,
     }))
 
 @mcp.tool()
