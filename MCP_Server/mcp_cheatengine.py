@@ -781,11 +781,17 @@ def start_native_code_finder(
     indirect_size: int = 0,
     nested_indirect_offset: int = 0,
     nested_size: int = 0,
+    stack_size: int = 0,
 ) -> str:
     """Start CE's native Find-out-what-accesses/writes collector.
 
     This uses CE's bo_FindCode debugger-event path instead of a synchronized
     Lua breakpoint callback. Keep Use Global Debug Routines disabled.
+
+    stack_size is how many bytes of stack to copy on every hit, 0 meaning
+    Cheat Engine's UI default of 4096. The copy happens while the hitting
+    thread is parked, so on a busy capture point ask for the smallest range
+    that covers the fields being decoded.
     """
     return format_result(ce_client.send_command("start_native_code_finder", {
         "address": address,
@@ -796,6 +802,7 @@ def start_native_code_finder(
         "indirect_size": indirect_size,
         "nested_indirect_offset": nested_indirect_offset,
         "nested_size": nested_size,
+        "stack_size": stack_size,
     }))
 
 @mcp.tool()

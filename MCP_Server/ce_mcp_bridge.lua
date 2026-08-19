@@ -1680,6 +1680,10 @@ function cmd_start_native_code_finder(params)
     local indirectSize = math.max(0, math.min(tonumber(params.indirect_size) or 0, 4096))
     local nestedIndirectOffset = math.max(0, tonumber(params.nested_indirect_offset) or 0)
     local nestedSize = math.max(0, math.min(tonumber(params.nested_size) or 0, 4096))
+    -- Bytes of stack to copy per hit. This is charged while the hitting thread
+    -- is parked, so ask for what the caller actually decodes rather than
+    -- inheriting Cheat Engine's 4096-byte UI default.
+    local stackSize = math.max(0, math.min(tonumber(params.stack_size) or 0, 4096))
     if indirectSize > 0 then
         if type(debug_configureCodeFinderEvents) ~= "function" then
             pcall(debug_stopCodeFinder, finder)
@@ -1692,7 +1696,7 @@ function cmd_start_native_code_finder(params)
         end
         local configured, configureResult = pcall(
             debug_configureCodeFinderEvents, finder, indirectStackOffset,
-            indirectSize, nestedIndirectOffset, nestedSize)
+            indirectSize, nestedIndirectOffset, nestedSize, stackSize)
         if not configured or not configureResult then
             pcall(debug_stopCodeFinder, finder)
             pcall(function() finder.close() end)
@@ -1712,6 +1716,7 @@ function cmd_start_native_code_finder(params)
         address = toHex(addr),
         size = size,
         access_type = accessType,
+        stack_size = stackSize,
         indirect_stack_offset = indirectStackOffset,
         indirect_size = indirectSize,
         nested_indirect_offset = nestedIndirectOffset,
