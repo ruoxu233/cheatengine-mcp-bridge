@@ -1801,6 +1801,8 @@ function cmd_drain_native_code_finder_events(params)
             current = nil
         elseif current and key == "SEQ" then
             current.sequence = tonumber(value) or 0
+        elseif current and key == "CAPTURE_TICKS" then
+            current.capture_ticks = tonumber(value) or 0
         elseif current and key == "STACK_BASE" then
             current.stack_base = "0x" .. value
         elseif current and key == "INDIRECT_BASE" then
